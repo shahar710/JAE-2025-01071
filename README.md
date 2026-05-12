@@ -14,9 +14,9 @@ This is the primary dataset used across all analyses. To maintain absolute stati
 **Key variables included in this dataset:**
 * **Taxonomy & Metadata:** Species name, family, basin (Red Sea or Mediterranean), and invasion status.
 * **Assemblage Groups:** Categorization into one of the four analyzed groups (Red Sea Natives, Red Sea Lessepsians, Mediterranean Natives, Mediterranean Lessepsians).
-* **Demographics:** Local abundance metrics derived from stereo-BRUVs (e.g., mean MaxN).
-* **Depth:** Depth limits and ranges (e.g., minimum depth, depth range).
-* **Habitat Affinities:** High-resolution, independent habitat associations (e.g., rocks, corals, sand, macroalgae, artificial structures). These are calculated as the proportion of deployments in which a specific habitat feature was present across all samples where the population appeared.
+* **Demographics:** Local abundance metrics derived from stereo-BRUVs.
+* **Depth:** Depth limits and ranges.
+* **Habitat Affinities:** High-resolution, independent habitat associations. These are calculated as the proportion of deployments in which a specific habitat feature was present across all samples where the population appeared.
 
 ---
 
