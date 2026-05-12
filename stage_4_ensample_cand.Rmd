@@ -1,0 +1,270 @@
+---
+title: "stage_4_ensample_cand"
+author: "DBPR"
+date: "2026-02-07"
+output: html_document
+---
+Ensampble of the two models' (LDA and GLMM) candidate ranks
+
+Library
+```{r}
+library(tidyverse)
+library(ggrepel)
+library(pROC)
+library(lme4)
+```
+
+Data
+```{r}
+# --- MASTER DATA PREPARATION ---
+data_full <- read.csv("./data/sp_level_data.csv") %>% 
+  # Ensure random effects are factors
+  mutate(Family = as.factor(Family))
+
+# A. Filter & Prep
+data_m1 <- data_full %>%
+  filter(group %in% c("Natives - Red Sea", "Lessepsians - Red Sea")) %>%
+  mutate(
+    # Create Binary Response: Natives=0, NIS=1
+    response = ifelse(group == "Lessepsians - Red Sea", 1, 0),
+    group_label = droplevels(factor(group)),
+    Family = droplevels(Family)
+  )
+```
+
+#1. Training data & model Evaluation
+##1.1) Calculate AUC & weights
+```{r}
+# Extract training probabilities
+# 1. Load the, Out-of-Sample Probabilities for the LDA
+lda_cv_data <- read.csv("./models/A)_Native_range_comparison_cv_probs.csv")
+
+# 2. Get Out-of-Sample Probabilities for the GLMM (LOOCV Loop)
+# STEP A: Create an empty container (a blank list of numbers) to hold our predictions.
+# We make it exactly as long as our dataset (e.g., 126 blank spaces).
+glmm_cv_probs <- numeric(nrow(data_m1))
+# STEP B: Load the original model. 
+# We just need its structure (the formula, random effects, etc.)
+final_glmm <- read_rds("./models/native_r_comp_glmm.rds")
+
+# STEP C: Start the "Hide and Seek" Loop.
+# "for(i in 1:nrow(data_m1))" means: "Run the code inside these brackets 126 times. 
+# The first time, i=1. The second time, i=2... all the way to the end."
+for(i in 1:nrow(data_m1)) {
+  # 1. CREATE THE TRAINING DATA (The 125 fish the model is allowed to see)
+  # The minus sign [-i, ] means "Give me all rows EXCEPT row number i"
+  train_data <- data_m1[-i, ]
+  # 2. CREATE THE TEST DATA (The 1 hidden fish)
+  # [i, ] means "Give me exactly row number i". 
+  # 'drop = FALSE' just forces R to keep it as a dataframe format instead of turning it into a raw vector.
+  test_data  <- data_m1[i, , drop = FALSE]
+  # 3. TRAIN THE TEMPORARY MODEL
+  # 'update()' takes our original model  and refits it using ONLY our 125 train_data fish.
+  cv_model <- suppressWarnings(update(final_glmm, data = train_data))
+  # 4. PREDICT THE HIDDEN FISH
+  # We ask the newly trained 'cv_model' to predict the risk for our 1 hidden 'test_data' fish.
+  # 'type = "response"' ensures it outputs a probability (0 to 1).
+  # 're.form = NA' tells the model to ignore random effects (like 'Family') when making this prediction, 
+  # focusing only on the main fixed effects (the traits).
+  # Finally, we save that single number into slot 'i' of our empty container from Step A.
+  glmm_cv_probs[i] <- predict(cv_model, newdata = test_data, type = "response", re.form = NA)
+}
+# The loop finishes, and 'glmm_cv_probs' is now a full list of 126, out-of-sample predictions
+
+# 3. Create a unified dataframe for the training calculations
+train_cv_data <- data_m1 %>%
+  select(species, response) %>%
+  mutate(glmm_cv_prob = glmm_cv_probs) %>%
+  left_join(lda_cv_data, by = "species") %>%
+  na.omit() # Ensures we only calculate on species present in both models
+
+# 4. Calculate the, Cross-Validated ROC and AUC for both models
+roc_glmm_cv <- roc(train_cv_data$response, train_cv_data$glmm_cv_prob, quiet = TRUE)
+roc_lda_cv  <- roc(train_cv_data$response, train_cv_data$lda_cv_prob, quiet = TRUE)
+
+auc_glmm_cv <- as.numeric(auc(roc_glmm_cv))
+auc_glmm_cv
+auc_lda_cv  <- as.numeric(auc(roc_lda_cv))
+auc_lda_cv
+
+# 5. Calculate True Performance Weights based on the CV-AUC
+total_cv_auc <- auc_glmm_cv + auc_lda_cv
+w_glmm <- auc_glmm_cv / total_cv_auc
+w_lda  <- auc_lda_cv / total_cv_auc
+
+print(paste("GLMM LOOCV AUC:", round(auc_glmm_cv, 3), "| Weight:", round(w_glmm, 3)))
+print(paste("LDA LOOCV AUC:", round(auc_lda_cv, 3), "| Weight:", round(w_lda, 3)))
+
+# 6. Find the  Optimal Threshold using the Cross-Validated Ensemble
+cv_ensemble_index <- (train_cv_data$glmm_cv_prob * w_glmm) + (train_cv_data$lda_cv_prob * w_lda)
+roc_cv_ensemble <- roc(train_cv_data$response, cv_ensemble_index, quiet = TRUE)
+
+opt_coords <- coords(roc_cv_ensemble, "best", ret = c("threshold", "specificity", "sensitivity"), best.method="youden")
+optimal_thresh <- opt_coords$threshold[1]
+```
+
+Plot ROC
+```{r}
+# Create a tiny dataframe 
+optimal_point_df <- data.frame(
+  specificity = opt_coords$specificity[1],
+  sensitivity = opt_coords$sensitivity[1]
+)
+
+p_roc <- ggroc(roc_cv_ensemble, colour = "darkblue", linewidth = 1) +
+  
+  theme_classic() +
+  
+  # Add the diagonal "random chance" reference line
+  geom_abline(intercept = 1, slope = 1, linetype = "dashed", color = "gray50") +
+  
+  # FIX: Correctly map the X and Y coordinates for the red dot
+  geom_point(data = optimal_point_df, 
+             aes(x = specificity, y = sensitivity), 
+             color = "red", size = 4) +
+  
+  # Add a text label next to the dot
+  annotate("text", 
+           x = opt_coords$specificity[1] + 0.15, 
+           y = opt_coords$sensitivity[1] - 0.05, 
+           label = paste0("Optimal cutoff:\n", round(optimal_thresh, 3)),
+           color = "red", fontface = "bold", size = 4) +
+           
+  labs(
+    x = "Specificity (True negative rate)",
+    y = "Sensitivity (True positive rate)",
+    caption = paste0("LOOCV Area Under the Curve (AUC): ", round(auc(roc_cv_ensemble), 3))
+  ) +
+  
+  theme(
+    plot.caption = element_text(size = 10, face = "italic")
+  )
+
+p_roc
+ggsave("./plots/Figure_ROC_Curve.png", p_roc, width = 15, height = 12, units = "cm", dpi = 300)
+```
+
+#2. Build the Performance-Weighted Ensemble for Future Candidates
+Now we apply the weights and threshold  derived above to the native species pool to predict future invaders.
+```{r}
+# Load predictions for the candidate pool
+pred_lda  <- read.csv("./models/lda_1_posterior_output_df.csv")
+pred_glmm <- read.csv("./models/watchlist_glmm_best_model.csv")
+
+# Merge, weight, and rank
+ensemble_data <- pred_glmm %>%
+  select(species, Family, glmm_probs = Probability) %>%
+  left_join(pred_lda %>% select(species, lda_probs = probs), by = "species") %>%
+  na.omit() %>%
+  mutate(
+    ensemble_index = (glmm_probs * w_glmm) + (lda_probs * w_lda),
+    
+    # CALCULATE RANKS
+    rank_glmm = dense_rank(desc(glmm_probs)),
+    rank_lda  = dense_rank(desc(lda_probs)),
+    rank_ensemble = dense_rank(desc(ensemble_index)),
+    
+    # Consensus Group based on Empirically Derived Threshold
+    consensus_group = case_when(
+      glmm_probs > optimal_thresh & lda_probs > optimal_thresh ~ "High consensus",
+      glmm_probs > optimal_thresh ~ "GLMM only",
+      lda_probs > optimal_thresh ~ "LDA only",
+      TRUE ~ "Low consensus"
+    )
+  ) %>%
+  arrange(desc(ensemble_index))
+
+# Lock in factor levels for plotting colors later
+ensemble_data$consensus_group <- factor(
+  ensemble_data$consensus_group,
+  levels = c("High consensus", "GLMM only", "LDA only", "Low consensus")
+)
+
+# Display and Save
+head(ensemble_data)
+write.csv(ensemble_data, "./models/watchlist_ensemble.csv", row.names = FALSE)
+```
+
+#3. Assess Model Similarity & Plot (Figure 5)
+```{r}
+# A. Statistical Correlation (Spearman Rank Correlation)
+cor_test <- cor.test(ensemble_data$rank_glmm, ensemble_data$rank_lda, method = "spearman")
+
+print(paste0("Spearman Correlation between LDA and GLMM Ranks: rho = ", 
+             round(cor_test$estimate, 2), 
+             " (p-value: ", signif(cor_test$p.value, 3), ")"))
+
+# B. Top 20 Overlap Calculation
+top_20_glmm <- ensemble_data %>% filter(rank_glmm <= 20) %>% pull(species)
+top_20_lda  <- ensemble_data %>% filter(rank_lda <= 20)  %>% pull(species)
+shared_spp  <- intersect(top_20_glmm, top_20_lda)
+
+print(paste0("Number of species shared in the Top 20 of both models: ", length(shared_spp)))
+print(paste("Shared species:", paste(shared_spp, collapse = ", ")))
+
+# C. Visual Comparison (Scatter Plot)
+
+# DYNAMICALLY EXTRACT TOP 10 LABELS:
+# Sort the dataframe by  final ensemble rank and pull the top 10 species names.
+top_10_labels <- ensemble_data %>%
+  arrange(desc(ensemble_index)) %>% # Change 'ensemble_rank' if  column name is different
+  slice(1:10) %>%
+  pull(species)
+
+custom_breaks <- c(1, seq(20, 140, by = 20))
+
+p_agreement <- ggplot(ensemble_data, aes(x = rank_lda, y = rank_glmm)) +
+  
+  geom_point(aes(color = consensus_group, label=species), alpha = 0.85, size = 2) +
+  
+  # Apply the dynamic top 10 labels here
+  ggrepel::geom_text_repel(
+    data = subset(ensemble_data, species %in% top_10_labels),
+    aes(label = species),
+    size = 3.25,
+    fontface = "italic",
+    box.padding = 0.6,
+    max.overlaps = Inf,
+    segment.alpha = 0.5
+  ) +
+  
+  scale_color_manual(values = c("High consensus" = "red", 
+                                "GLMM only" = "purple", 
+                                "LDA only" = "brown", 
+                                "Low consensus" = "grey80")) +
+  
+  scale_x_reverse(name = "LDA rank",
+                  breaks = custom_breaks,       
+                  limits = c(145, 1),            
+                  expand = expansion(mult = c(0.05, 0))) + 
+  
+  scale_y_reverse(name = "GLMM rank",
+                  breaks = custom_breaks,       
+                  limits = c(145, 1),          
+                  expand = expansion(mult = c(0.05, 0))) +
+  
+  theme_classic() +
+  
+  theme(
+    legend.position = c(0.76, 0.35), 
+    legend.justification = c("left", "top"),
+    legend.direction = "vertical",
+    legend.background = element_blank(),
+    legend.box.background = element_blank(),
+    legend.key = element_blank(),
+    legend.text = element_text(size=10),
+    plot.caption = element_text(size=10)
+  ) +
+  
+  labs(caption = paste0("Spearman ρ: ", round(cor_test$estimate, 2)),
+       color = "Consensus group") + 
+  
+  coord_cartesian(xlim=c(110,-5), ylim=c(70,-5))
+
+p_agreement
+
+# Save Outputs
+ggsave("./plots/Figure_5.png", p_agreement, width = 18, height = 12, units = "cm", dpi = 300)
+ggsave("./plots/Figure_5.pdf", p_agreement, width = 18, height = 12, units = "cm", dpi = 300,device = "pdf")
+```
+

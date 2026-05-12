@@ -1,0 +1,506 @@
+---
+title: "stage_3_1_predict_nis_lda"
+author: "DBPR"
+date: "2026-02-02"
+output: html_document
+---
+
+In this code we will construct an holistic model aimed at testing whether traits can predict NIS/ non-NIS status.
+
+Libraries
+```{r}
+library(tidyverse)
+#library(MASS)
+library(ggrepel)
+library(pROC)
+options(scipen = 999)
+```
+#1) LDA
+##1.1) Data prep.
+```{r}
+# --- 1. DATA PREPARATION ---
+# Clean data, define groups, and select only numeric predictors (Body size excluded)
+lda_data_clean <- read.csv("./data/sp_level_data.csv") %>%
+  
+  # Select Predictors
+  dplyr::select(
+    species,
+    group,
+    "Commonness"=n_presence,
+    "MaxN"=mean_MaxN,
+    "Depth range"=depth_range, 
+    "Min. depth"=min_depth, 
+    "Temperature range"=sbt_range,
+    `Corals`=corals,
+    `Rocks`=rocks, 
+    `Sand`=sand, 
+    `Seagrass`=seagrass, 
+    `Algae`=macroalgae, 
+    `Artificial`=artificial, # Substrates
+    `Silt`=silt,
+    `Habitat breadth`=B_prime_std) %>%
+  na.omit() # LDA cannot handle NAs
+
+# Define Colors for consistency
+custom_colors <- c("Natives - Red Sea" = "#007989", 
+                   "Lessepsians - Red Sea"     = "#D9643E", 
+                   "Lessepsians - Med. Sea"     = "#F8B954", 
+                   "Natives - Med. Sea" = "#073956")
+```
+##2.2) LDA function
+```{r}
+perform_lda_analysis <- function(data, g1, g2, title_text, text_x_pos = 0.82, csv_filename = NULL) {
+  
+  # A. Filter Data
+  sub_data <- data %>% filter(group %in% c(g1, g2))
+  sub_data$group <- droplevels(factor(sub_data$group))
+  
+  # B. ROBUST FILTERING
+  is_robust_trait <- function(x) {
+    if(!is.numeric(x)) return(TRUE) 
+    has_variance <- var(x, na.rm=TRUE) > 0
+    is_common    <- sum(x > 0, na.rm=TRUE) >= 5 
+    return(has_variance & is_common)
+  }
+  
+  sub_data <- sub_data %>% select_if(is_robust_trait)
+  
+  # C. Run Standard LDA (For loadings and plotting)
+  lda_model <- MASS::lda(group ~ ., data = sub_data %>% dplyr::select(-species))
+  predictions <- predict(lda_model)
+  
+  # --- NEW STEP: Cross-Validated AUC (Replaces MANOVA) ---
+  # Run LDA again with CV=TRUE to get unbiased, out-of-sample posterior probabilities
+  lda_cv <- MASS::lda(group ~ ., data = sub_data %>% dplyr::select(-species), CV = TRUE)
+  
+  # Create a binary response variable (1 for g2, 0 for g1)
+  actual_class <- ifelse(sub_data$group == g2, 1, 0)
+  
+  # Extract the cross-validated probabilities for group g2
+  predicted_probs <- lda_cv$posterior[, as.character(g2)]
+  
+  # Calculate the Area Under the Curve (AUC)
+  roc_obj <- roc(actual_class, predicted_probs, quiet = TRUE)
+  cv_auc  <- as.numeric(auc(roc_obj))
+  
+  # Create the new, statistically sound plot label
+  plot_label <- paste0("LOOCV AUC = ", round(cv_auc, 2))
+  
+  # --- CREATE SUMMARY DATAFRAME ---
+  stats_df <- data.frame(
+    Comparison = paste(g1, "vs", g2),
+    LOOCV_AUC = round(cv_auc, 3)
+  )
+  #EXPORT CV PROBABILITIES TO CSV
+  cv_probs_df <- data.frame(
+    species = sub_data$species,
+    lda_cv_prob = predicted_probs
+  )
+  
+  # Clean the title_text to make a safe filename (removes spaces)
+  safe_title <- gsub(" ", "_", title_text)
+  cv_filename <- paste0("./models/", safe_title, "_cv_probs.csv")
+  write.csv(cv_probs_df, cv_filename, row.names = FALSE)
+  message(paste("Saved CV probabilities to:", cv_filename))
+  
+  # E. Extract Loadings
+  loadings <- as.data.frame(lda_model$scaling)
+  colnames(loadings) <- "LD1"
+  loadings$Trait <- rownames(loadings)
+  loadings$Trait <- gsub("`", "", rownames(loadings))
+  loadings <- loadings %>% arrange(desc(abs(LD1)))
+  
+  # EXPORT TO CSV
+  if (!is.null(csv_filename)) {
+    write.csv(loadings, file = csv_filename, row.names = FALSE)
+    message(paste("Saved loadings to:", csv_filename))
+  }
+  
+  # F. Plotting
+  plot_data <- data.frame(
+    species = sub_data$species,
+    Group = sub_data$group,
+    LD1_Score = predictions$x[,1]
+  )
+  
+  # Scaling Arrows
+  max_score <- max(abs(plot_data$LD1_Score))
+  max_loading <- max(abs(loadings$LD1))
+  arrow_scale <- (max_score / max_loading) * 0.8 
+  
+  top_traits <- loadings %>% head(5)
+  
+  # DYNAMIC X POSITION
+  x_range <- max(plot_data$LD1_Score) - min(plot_data$LD1_Score)
+  x_pos   <- min(plot_data$LD1_Score) + (text_x_pos * x_range)
+
+  p <- ggplot() +
+    geom_density(data = plot_data, aes(x = LD1_Score, fill = Group), 
+                 alpha = 0.4, color = NA) +
+    geom_rug(data = plot_data, aes(x = LD1_Score, color = Group)) +
+    
+    geom_segment(data = top_traits, aes(x = 0, y = 0, xend = LD1 * arrow_scale, yend = 0),
+                 arrow = arrow(length = unit(0.2, "cm")), color = "black", linewidth = 0.8) +
+    
+    geom_text_repel(data = top_traits, aes(x = LD1 * arrow_scale, y = 0, label = Trait),
+                    direction = "y", nudge_y = 0.1, fontface = "bold", size = 3, 
+                    max.overlaps = 15, box.padding = .65) +
+    
+    #Now displays the CV-AUC
+    annotate("text", x = x_pos, y = Inf, label = plot_label, 
+             hjust = 0, vjust = 1.3, size = 3, lineheight = 0.9) +
+    
+    scale_fill_manual(name = "Assemblage", values = custom_colors) +
+    scale_color_manual(name = "Assemblage", values = custom_colors) +
+    
+    theme_bw() +
+    theme(
+      panel.grid = element_blank(),
+      legend.position = c(0.02, 0.98), 
+      legend.justification = c(0, 1),
+      legend.background = element_rect(fill = "NA", color = "NA", linewidth = 0.5),
+      axis.title = element_blank()
+    ) +
+    
+    labs(title = title_text,
+         x = "LD 1", y = "Density")
+  
+  return(list(
+    model = lda_model, 
+    loadings = loadings, 
+    plot = p, 
+    stats_table = stats_df,
+    cv_auc = cv_auc # Exposing the AUC score directly for  ensemble step later!
+  ))
+}
+```
+
+##2.3) LDA analyses
+```{r}
+# 1) Red Sea Natives vs Red Sea NIS (Invasiveness)
+# "What makes a species capable of leaving?"
+lda_1 <-
+  perform_lda_analysis(
+    lda_data_clean,
+    "Natives - Red Sea",
+    "Lessepsians - Red Sea",
+    "A) Native range comparison",
+    csv_filename = "./models/native_range_comp_loadings.csv"
+  )
+lda_1
+saveRDS(lda_1$model,"./models/lda_1.rds")
+# 2) Red Sea NIS vs Med Sea NIS (filtering)
+# "Did they change during transit?"
+# FIX: Removing Silt to solve VIF collinearity with Sand and Algae
+lda_2 <-
+  perform_lda_analysis(
+    lda_data_clean %>% dplyr::select(-Silt), 
+    "Lessepsians - Red Sea",
+    "Lessepsians - Med. Sea",
+    "B) Native-invaded range comparison",
+    csv_filename = "./models/native_invaded_range_comp_loadings.csv"
+  )
+lda_2
+
+# 3) Med Sea NIS vs Med Sea Natives (establishment)
+# "How do they fit into the new community?"
+# FIX: Removing Rocks (previous fix) and Silt (to solve VIF collinearity with Min. depth)
+lda_3 <-
+  perform_lda_analysis(
+    lda_data_clean %>% dplyr::select(-Rocks, -Silt),
+    "Lessepsians - Med. Sea",
+    "Natives - Med. Sea",
+    "C) Invaded range comparison",
+    csv_filename = "./models/invaded_range_comp_loadings.csv"
+  )
+lda_3
+```
+
+##2.4) Sensitivity analysis: Shared habitats only
+```{r}
+# --- SENSITIVITY: Test Native-Invaded shift ONLY on shared environmental space ---
+# We might argue shifts are obvious due to lack of corals/different temps in the Med.
+# We strip away variables that are completely missing (zero variance) in ONE of the basins.
+
+# 1. Filter for just the Lessepsians across both basins
+sens_data <- lda_data_clean %>% 
+  filter(group %in% c("Lessepsians - Red Sea", "Lessepsians - Med. Sea"))
+
+# 2. Identify variables that are completely absent (sum = 0) in EITHER basin
+# By checking group variance, we find variables like 'Corals' which are 0 in the Med.
+valid_vars <- names(sens_data)[sapply(names(sens_data), function(var) {
+  if(!is.numeric(sens_data[[var]])) return(TRUE) # keep species/group
+  
+  # Check sum in Red Sea
+  sum_rs <- sum(sens_data[[var]][sens_data$group == "Lessepsians - Red Sea"], na.rm = TRUE)
+  # Check sum in Med Sea
+  sum_med <- sum(sens_data[[var]][sens_data$group == "Lessepsians - Med. Sea"], na.rm = TRUE)
+  
+  # Keep only if present in BOTH (sum > 0)
+  return(sum_rs > 0 & sum_med > 0)
+})]
+
+# We also manually exclude Temperature Range as the Med is inherently more variable seasonally
+sens_data_filtered <- sens_data %>% 
+  dplyr::select(all_of(valid_vars)) %>%
+  dplyr::select(-`Temperature range`,-Seagrass)
+
+print("Variables retained for Sensitivity Analysis (Shared Space Only):")
+print(names(sens_data_filtered))
+
+# 3. Run the LDA on this restricted space
+lda_2_sens <- perform_lda_analysis(
+    sens_data_filtered,
+    "Lessepsians - Red Sea",
+    "Lessepsians - Med. Sea",
+    "Sensitivity: Shared Space Comparison",
+    csv_filename = "./models/native_invaded_sensitivity_loadings.csv"
+  )
+lda_2_sens
+print("--- SENSITIVITY LDA RESULTS ---")
+print(lda_2_sens$stats_table)
+# If this is still significant, it proves active behavioral flexibility (Niche Release)
+# rather than just passive displacement caused by missing habitats.
+```
+
+##2.5) Plotting
+```{r}
+# --- 4. COMBINED PLOT ---
+final_plot <- gridExtra::arrangeGrob(
+  lda_1$plot,
+  lda_2_sens$plot+labs(title = "B) Native-invaded range comparison"),
+  lda_3$plot,
+  ncol = 1,
+  bottom = "LD 1",
+  left = "Density"
+)
+ggsave("./plots/Figure_3.png", final_plot, width = 15, height = 25, units = "cm", dpi = 300,bg = "white")
+ggsave("./plots/Figure_3.pdf", final_plot, width = 15, height = 25, units = "cm", dpi = 300,bg = "white",device = cairo_pdf)
+```
+
+Plot lda 2
+```{r}
+ggsave(
+  "./plots/SI_lda_2.png",
+  lda_2$plot +
+    theme(title = element_blank()),
+  width = 15,
+  height = 10,
+  units = "cm",
+  dpi = 300,
+  bg = "white",
+  device = "png"
+)
+
+```
+
+#3. Predicting future invaders
+```{r}
+# A. Determine the "Direction of Invasiveness" using data stored in the plot object
+# We access the dataframe used for the density plot (lda_1$plot$data)
+# This guarantees the Scores and Groups are aligned.
+plot_data <- lda_1$plot$layers[[1]]$data
+
+train_means <- tapply(plot_data$LD1_Score, plot_data$Group, mean)
+# B. Check direction
+# If mean(Lessepsians) < mean(Natives), we flip the sign (-1)
+# High Score must equal High Risk
+nis_mean    <- train_means["Lessepsians - Red Sea"]
+native_mean <- train_means["Natives - Red Sea"]
+direction   <- ifelse(nis_mean > native_mean, 1, -1)
+
+# C. Project Red Sea Natives
+rs_natives <- lda_data_clean %>% filter(group == "Natives - Red Sea")
+
+# Predict
+pred_invaders <- predict(lda_1$model, newdata = rs_natives %>% dplyr::select(-species, -group))
+
+# D. Assign and Correct Scores
+rs_natives$Invasion_Potential <- pred_invaders$x[,1] * direction
+
+# E. Sort and Save (Body size excluded from select)
+ranked_candidates <- rs_natives %>% 
+  arrange(desc(Invasion_Potential)) %>% 
+  dplyr::select(species, Invasion_Potential, Algae, MaxN, `Depth range`, Corals, Rocks, Seagrass, Artificial, Silt)
+
+# Save
+write.csv(ranked_candidates, "./models/watchlist_lda.csv", row.names = FALSE)
+
+print(paste0("Direction Correction applied: multiplied scores by ", direction))
+print("--- TOP 10 RED SEA NATIVES MOST LIKELY TO INVADE ---")
+head(ranked_candidates, 10)
+
+#save posterior probs.
+# 1. Explicitly predict ONLY on the 108 native species
+# This forces the output to be exactly 108 rows long
+lda_1_preds <- predict(lda_1$model, newdata = rs_natives)
+
+# 2. Create the standalone data frame
+lda_1_posterior_output_df <- data.frame(
+  species = rs_natives$species,
+  probs = lda_1_preds$posterior[, "Lessepsians - Red Sea"]
+)
+
+# 3. (Optional but recommended) Sort the list from highest risk to lowest risk
+lda_1_posterior_output_df <- lda_1_posterior_output_df %>%
+  arrange(desc(probs))
+
+write.csv(lda_1_posterior_output_df,"./models/lda_1_posterior_output_df.csv",row.names = F)
+```
+
+Export loadings table
+```{r}
+# 1. Read the individual results
+loadings_1 <- read.csv("./models/native_range_comp_loadings.csv") %>% 
+  rename(`Native range comparison` = LD1)
+
+loadings_2 <- read.csv("./models/native_invaded_range_comp_loadings.csv") %>% 
+  rename(`Native-invaded range comparison` = LD1)
+
+loadings_3 <- read.csv("./models/invaded_range_comp_loadings.csv") %>% 
+  rename(`Invaded range comparison` = LD1)
+
+# Read the new sensitivity analysis results
+loadings_sens <- read.csv("./models/native_invaded_sensitivity_loadings.csv") %>% 
+  rename(`Native-invaded (Sensitivity)` = LD1)
+
+# 2. Merge them into one table
+all_loadings <- loadings_1 %>%
+  full_join(loadings_2, by = "Trait") %>%
+  full_join(loadings_sens, by = "Trait") %>% # Add the sensitivity column
+  full_join(loadings_3, by = "Trait") %>%
+  arrange(Trait) %>%  # Sort alphabetically by trait name
+  dplyr::select(
+    Trait,
+    `Native range comparison`,
+    `Native-invaded range comparison`,
+    `Native-invaded (Sensitivity)`,
+    `Invaded range comparison`
+  )
+
+# 3. Export
+write.csv(all_loadings, "./models/lda_loadings_summary.csv", row.names = FALSE)
+
+# 4. Print for verification
+print(all_loadings)
+```
+
+##2.4) LDA assumptions
+```{r}
+##2.6) LDA assumptions
+library(biotools)
+library(car)
+
+check_lda_assumptions <- function(data, g1, g2) {
+  
+  # 1. Prep Data (Same cleaning as before)
+  sub_data <- data %>% filter(group %in% c(g1, g2))
+  sub_data$group <- factor(sub_data$group)
+  
+  # Remove Low Variance Columns (Same logic as robust LDA)
+  is_robust <- function(x) {
+    if(!is.numeric(x)) return(TRUE)
+    var(x, na.rm=TRUE) > 0 && sum(x > 0, na.rm=TRUE) >= 5
+  }
+  sub_data <- sub_data %>% select_if(is_robust)
+  
+  # Predictors Matrix
+  predictors <- sub_data %>% dplyr::select(-species, -group)
+  
+  cat(paste0("\n--- ASSUMPTION CHECK: ", g1, " vs ", g2, " ---\n"))
+  
+  # --- CHECK 1: MULTICOLLINEARITY ---
+  # If variables are highly correlated, loadings (rankings) become unstable.
+  # We check Variance Inflation Factor (VIF). VIF > 10 is bad.
+  cat("\n1. Multicollinearity (Max VIF):\n")
+  tryCatch({
+    # We fit a dummy linear model just to get VIF values
+    dummy_mod <- lm(as.numeric(sub_data$group) ~ ., data = predictors)
+    vif_vals <- car::vif(dummy_mod)
+    print(vif_vals[vif_vals > 5]) # Only show problematic ones
+    if(max(vif_vals) < 5) cat("  - Pass: All VIFs < 5 (Low correlation)\n")
+  }, error = function(e) cat("  - Could not calc VIF (Matrix singular)\n"))
+
+  # --- CHECK 2: HOMOGENEITY OF COVARIANCES (Box's M) ---
+  # LDA assumes both groups have the same "shape" (variance).
+  cat("\n2. Homogeneity of Covariances (Box's M):\n")
+  tryCatch({
+    box_res <- biotools::boxM(predictors, sub_data$group)
+    print(box_res)
+    if(box_res$p.value < 0.05) {
+      cat("  - WARNING: Assumption Violated. Groups have different variances.\n")
+      cat("  - Note: This is expected with unbalanced sample sizes (144 vs 22).\n")
+    } else {
+      cat("  - Pass: Variances are homogeneous.\n")
+    }
+  }, error = function(e) cat("  - Box's M failed (likely too few NIS samples).\n"))
+  
+  # --- CHECK 3: NORMALITY (Visual) ---
+  # Ecological data (like coral %) is rarely normal. 
+  # We check if the LD scores look roughly bell-shaped.
+  cat("\n3. Normality Check:\n")
+  cat("  - See generated QQ-Plots. If points deviate from the line, data is non-normal.\n")
+  
+  # Run temp LDA for plotting
+  lda_mod <- MASS::lda(group ~ ., data = sub_data %>% dplyr::select(-species))
+  scores <- predict(lda_mod)$x[,1]
+  
+  qqnorm(scores, main = paste("QQ Plot: ", g1, "vs", g2)); qqline(scores, col = "red")
+}
+
+# RUN THE CHECKS
+par(mfrow=c(1,3)) # View 3 plots at once
+
+# 1. Native range (No collinearity issues, keep as is)
+check_lda_assumptions(lda_data_clean, "Natives - Red Sea", "Lessepsians - Red Sea")
+
+# 2. Native-invaded range (Remove Silt)
+check_lda_assumptions(lda_data_clean %>% dplyr::select(-Silt), "Lessepsians - Red Sea", "Lessepsians - Med. Sea")
+
+# 3. Invaded range (Remove Rocks and Silt)
+check_lda_assumptions(lda_data_clean %>% dplyr::select(-Rocks, -Silt), "Lessepsians - Med. Sea", "Natives - Med. Sea")
+```
+
+Summary:
+We can trust the Loadings: Since VIFs are good, we can confidently say which traits matter (e.g., "Corals" and "Macroalgae").
+
+We can trust the LD1 Axis: The general direction of separation is likely real.
+
+We should distrust the P-value (Slightly): If p=0.04, be skeptical. If p=0.005 (like we found), it's safe even with the violation.
+
+Extract species scores
+```{r}
+lda_1$plot$layers[[1]]$data %>%
+  arrange(desc(LD1_Score))
+
+lda_2$plot$layers[[1]]$data %>%
+  arrange(desc(LD1_Score))
+
+lda_2_sens$plot$layers[[1]]$data %>%
+  arrange(desc(LD1_Score))
+
+lda_3$plot$layers[[1]]$data %>%
+  arrange(desc(LD1_Score))
+```
+
+LDAs summari table
+```{r}
+# Combine the stats tables from all four LDA models
+lda_summary_table <- dplyr::bind_rows(
+  lda_1$stats_table,
+  lda_2$stats_table,
+  lda_3$stats_table,
+  lda_2_sens$stats_table
+)
+
+# Overwrite the Comparison column with the standardized manuscript terminology
+lda_summary_table$Comparison <- c(
+  "Native range comparison",
+  "Native-invaded range comparison",
+  "Invaded range comparison",
+  "Native-invaded range comparison (sensitivity)"
+)
+lda_summary_table
+write.csv(lda_summary_table,"./models/lda_summary_table.csv",row.names = F)
+```
+

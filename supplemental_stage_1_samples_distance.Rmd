@@ -1,0 +1,140 @@
+---
+title: "supplemental_stage_1_samples_distance"
+author: "DBPR"
+date: "2026-03-12"
+output: html_document
+---
+
+Libraries
+```{r}
+library(tidyverse)
+library(lubridate)
+library(geosphere) # For calculating geographic distances
+```
+
+```{r}
+# 1. Load the MaxN data
+maxn_data <- readxl::read_excel("./data/18097061/med_red_MaxN_data.xlsx", sheet = 1)
+
+# 2. Load and filter the metadata
+metadata <- readxl::read_excel("./data/18097061/Metadata.xlsx", sheet = 1) %>% 
+  # Remove the specific problem OpCodes
+  filter(!OpCode %in% c("isrsdot201119B","isrsdot201119A","israchz260422H","isrnaha280722F","isrrosh071020C")) %>%
+  # Keep ONLY the OpCodes that also exist in the maxn_data
+  semi_join(maxn_data, by = "OpCode")
+metadata_processed <- metadata %>%
+  # Keep only samples that were successfully analyzed (optional but recommended)
+  filter(`analyzed?` == "yes") %>% 
+  # Drop rows missing coordinates or time
+  filter(!is.na(dep_time), !is.na(lat_y), !is.na(lon_x)) %>%
+  mutate(
+    # Extract the clean date and clean time
+    pure_date = as.Date(date),
+    pure_time = format(dep_time, "%H:%M:%S"),
+    
+    # Combine into a single, correct deployment datetime
+    dep_datetime = ymd_hms(paste(pure_date, pure_time)),
+    
+    # Calculate sampling window: start (deploy + 5m) and end (start + 60m)
+    start_time = dep_datetime + minutes(5),
+    end_time = start_time + minutes(60)
+  )
+
+# --- 2. FIND SIMULTANEOUS PAIRS ---
+# Join the dataset to itself by the exact date to find overlapping cameras
+simultaneous_pairs <- metadata_processed %>%
+  inner_join(metadata_processed, by = "pure_date", suffix = c("_1", "_2")) %>%
+  # Keep only unique pairs (prevents matching A-B and B-A, or A-A)
+  filter(OpCode_1 < OpCode_2) %>%
+  # Time overlap logic: Cam 1 starts before Cam 2 ends AND Cam 2 starts before Cam 1 ends
+  filter(start_time_1 < end_time_2 & start_time_2 < end_time_1)
+
+# --- 3. CALCULATE HORIZONTAL DISTANCE ---
+simultaneous_pairs <- simultaneous_pairs %>%
+  rowwise() %>%
+  mutate(
+    # distHaversine calculates actual spatial distance accounting for Earth's curvature
+    distance_m = distHaversine(
+      p1 = c(lon_x_1, lat_y_1), 
+      p2 = c(lon_x_2, lat_y_2)
+    )
+  ) %>%
+  ungroup()
+
+# --- 4. FLAG SAMPLES IN ORIGINAL DATASET ---
+simultaneous_opcodes <- unique(c(simultaneous_pairs$OpCode_1, simultaneous_pairs$OpCode_2))
+
+metadata <- metadata %>%
+  mutate(
+    is_simultaneous = OpCode %in% simultaneous_opcodes
+  )
+
+# --- 5. PRINT THE SUMMARY METRICS ---
+total_samples <- nrow(metadata_processed)
+simultaneous_count <- length(simultaneous_opcodes)
+percent_simultaneous <- round((simultaneous_count / total_samples) * 100, 2)
+
+cat("=== DEPLOYMENT SUMMARY ===\n")
+cat("Total valid samples analyzed:", total_samples, "\n")
+cat("Samples sampling simultaneously with at least one other camera:", 
+    simultaneous_count, paste0("(", percent_simultaneous, "%)\n\n"))
+
+if(nrow(simultaneous_pairs) > 0) {
+  cat("=== DISTANCE SUMMARY BETWEEN SIMULTANEOUS CAMERAS (Meters) ===\n")
+  cat("Minimum distance:", round(min(simultaneous_pairs$distance_m), 2), "m\n")
+  cat("Average distance:", round(mean(simultaneous_pairs$distance_m), 2), "m\n")
+  cat("Maximum distance:", round(max(simultaneous_pairs$distance_m), 2), "m\n")
+} else {
+  cat("No simultaneous deployments found.\n")
+}
+```
+
+Plot
+```{r}
+# --- 6. PLOT DENSITY OF DISTANCES (MEAN & MODE) ---
+# 1. Calculate the Mean
+mean_distance <- mean(simultaneous_pairs$distance_m, na.rm = TRUE)
+
+# 2. Calculate the Mode (Peak of the continuous density curve)
+dist_density <- density(simultaneous_pairs$distance_m, na.rm = TRUE)
+mode_distance <- dist_density$x[which.max(dist_density$y)]
+mode_y <- max(dist_density$y) # The exact height of the mode
+
+# 3. Calculate the Y-value for the Mean on the density curve
+# approxfun creates an interpolation function from the density coordinates
+density_interp <- approxfun(dist_density$x, dist_density$y)
+mean_y <- density_interp(mean_distance) # The exact height at the mean
+
+# 4. Create the density plot
+distance_plot <- ggplot(simultaneous_pairs, aes(x = distance_m)) +
+  geom_density(fill = "grey", alpha = 0.6, color = "black") +
+  
+  # Add vertical line for the MEAN using geom_segment (stops at the curve)
+  geom_segment(x = mean_distance, xend = mean_distance, 
+               y = 0, yend = mean_y, 
+               color = "darkred", linetype = "dashed", size = 1.2) +
+  annotate("text", x = mean_distance + 50, y = max(dist_density$y) * 0.85, 
+           label = paste("Mean:", round(mean_distance, 1), "m"), 
+           color = "darkred", hjust = 0) +
+  
+  # Add vertical line for the MODE using geom_segment (stops at the curve)
+  geom_segment(x = mode_distance, xend = mode_distance, 
+               y = 0, yend = mode_y, 
+               color = "darkgreen", linetype = "dotted", size = 1.2) +
+  annotate("text", x = mode_distance - 50, y = max(dist_density$y) * 0.95, 
+           label = paste("Mode:", round(mode_distance, 1), "m"), 
+           color = "darkgreen", hjust = 1) +
+           
+  # Labels and theme
+  labs(
+    x = "Horizontal distance (meters)",
+    y = "Density") +
+  theme_classic() +
+  theme(
+    axis.text = element_text(size = 10)
+  )
+
+# Display the plot
+print(distance_plot)
+```
+

@@ -1,0 +1,293 @@
+---
+title: "stage_3_2_predict_nis_glmm"
+author: "DBPR"
+date: "2026-02-02"
+output: html_document
+---
+
+In this code we will construct an holistic model aimed at testing whether traits can predict invaders/ non-invaders status.
+
+Libraries
+```{r}
+library(tidyverse)
+library(lme4)
+library(DHARMa)
+library(performance)
+library(broom.mixed)
+library(gridExtra)
+library(car)      # For calculating VIF
+library(pbapply)  # For a progress bar
+library(glmm.hp)
+options(scipen = 999)
+```
+
+#1) Setup and data prep.
+
+```{r}
+# --- MASTER DATA PREPARATION ---
+data_full <- read.csv("./data/sp_level_data.csv") %>% 
+  # Ensure random effects are factors
+  mutate(Family = as.factor(Family))
+
+# A. Filter & Prep
+data_m1 <- data_full %>%
+  filter(group %in% c("Natives - Red Sea", "Lessepsians - Red Sea")) %>%
+  mutate(
+    # Create Binary Response: Natives=0, NIS=1
+    response = ifelse(group == "Lessepsians - Red Sea", 1, 0),
+    group_label = droplevels(factor(group)),
+    Family = droplevels(Family)
+  )
+```
+
+#2) Dredge 
+all possible models and find the best model
+```{r warning=FALSE}
+library(MuMIn)
+
+# IMPORTANT: MuMIn requires this setting to run dredge. 
+# It ensures the dataset doesn't change size due to missing values.
+options(na.action = "na.fail")
+
+# 1. Fit the Global Model
+# This is the maximal model containing all 16 predictors and the random effect
+cat("Fitting the global model...\n")
+global_model <- glmer(
+  response ~ 
+    scale(mean_MaxN) + 
+    scale(n_presence) + 
+    scale(depth_range) + 
+    scale(min_depth) + 
+    scale(sbt_min) + 
+    scale(sbt_range) + 
+    scale(sbt_max) + 
+    scale(artificial) + 
+    scale(corals) + 
+    scale(seagrass) + 
+    scale(silt) + 
+    scale(gravel) + 
+    scale(sand) + 
+    scale(rocks) + 
+    scale(B_prime_std) + 
+    scale(macroalgae) + 
+    (1 | Family),
+  data = data_m1,
+  family = binomial
+)
+
+# 2. Run the Dredge Function
+# 2. Run or Load the Dredge Function
+model_file_path <- "./models/dredge/all_models.rds"
+
+if (file.exists(model_file_path)) {
+  
+  cat("Saved dredge file found! Loading models instantly to save time...\n")
+  all_models <- readRDS(model_file_path)
+  
+} else {
+  
+  cat("No saved file found. Starting dredge (this may take several hours)...\n")
+  # Run the heavy computation
+  all_models <- dredge(global_model)
+  
+  # Immediately save it so never have to run it again
+  saveRDS(all_models, model_file_path)
+  write.csv(all_models %>% as_tibble(), "./junk/all_models.csv", row.names = FALSE)
+  cat("Dredge complete and saved!\n")
+  
+}
+
+# 3. View the Results
+# Look at the top 10 models ranked by AICc (dredge uses AICc by default for small sample sizes)
+cat("\nTop models ranked by AICc:\n")
+head(all_models, 10)
+
+# 4. Extract the Best Model
+# Get the absolute best model (rank 1)
+best_dredged_model <- get.models(all_models, 1)[[1]]
+
+cat("\nSummary of the BEST dredged model:\n")
+summary(best_dredged_model)
+
+# Reset na.action to default after are done
+options(na.action = "na.omit")
+```
+
+relative importance of each predictor
+```{r}
+all_models=read_rds("./models/dredge/all_models.rds")
+importance_ranking <- MuMIn::sw(all_models)
+
+# 1. Extract the data directly from the MuMIn 'importance_ranking' object
+importance_df <- data.frame(
+  Predictor = names(importance_ranking),
+  Sum_of_Weights = as.numeric(importance_ranking),
+  N_Models = attr(importance_ranking, "n.models")
+)
+
+# 2. Clean up the predictor names (Remove "scale(" and ")" for a polished look)
+importance_df$Predictor <- gsub("scale\\(|\\)", "", importance_df$Predictor)
+
+# 3. write result
+write.csv(importance_df,"./junk/importance_df.csv",row.names = F)
+```
+
+#3) Model 1: Native range comparison Comparison:
+Red Sea natives (0) vs. Red Sea NIS (1) Hypothesis: Who leaves?
+```{r}
+# B. Run the best model
+# Removed body size from the formula
+m1 <- glmer(
+  response ~ 
+    scale(min_depth) + 
+    scale(corals) +
+    (1 | Family),
+  data = data_m1,
+  family = binomial)
+#saveRDS(m1,"./models/native_r_comp_glmm.rds")
+# C. Diagnostics
+summary(m1)
+MuMIn::AICc(m1)
+performance::check_collinearity(m1)
+performance::check_convergence(m1)
+performance::check_singularity(m1)
+r2_m1 <- performance::r2_nakagawa(m1)
+print(r2_m1)
+# DHARMa Residuals
+plot(simulateResiduals(m1))
+```
+
+##2.1) summary
+```{r}
+m1_res <- broom.mixed::tidy(m1, conf.int = TRUE, conf.level = 0.95) %>%
+  filter(effect == "fixed", term != "(Intercept)") %>%
+  mutate(
+    term_clean = case_when(
+      grepl("min_depth", term) ~ "Min. depth",
+      grepl("corals", term) ~ "Coral association",
+      TRUE ~ term
+    ),
+    is_significant = ifelse(p.value < 0.05, "Significant", "Not Significant")
+  ) %>% 
+  select(-group,-effect,-term) %>% 
+  select(term_clean, everything())
+
+r2_label_m1 <- paste0("R²(m)=", round(r2_m1$R2_marginal,2), " | R²(c)=", round(r2_m1$R2_conditional,2))
+```
+
+#3) Predict future invaders
+Here we apply the model trained in Step 2 to the current Red Sea native community. We identify which native species have the highest probability of being “misclassified” as invaders by the model (i.e., they have high invasion potential based on their traits and phylogeny).
+```{r}
+# 1. Filter for Red Sea Natives only (The candidates)
+# We ensure we drop NAs so the rows align with predictions
+# Removed body size from the select statement
+candidates <- data_full %>% 
+  filter(group == "Natives - Red Sea") %>%
+  select(species, Family, min_depth, corals) %>%
+  na.omit()
+
+# 2. Predict Probability
+# type = "response" gives us the probability scale (0 to 1)
+candidates$invasion_prob <- predict(m1, newdata = candidates, type = "response")
+
+# 3. Create Ranked List
+watchlist <- candidates %>%
+  select(species, Family, invasion_prob, corals) %>%
+  arrange(desc(invasion_prob)) %>%
+  mutate(
+    Rank = row_number(),
+    Probability = round(invasion_prob, 3)
+  ) %>%
+  select(Rank, species, Family, Probability, everything(), -invasion_prob)
+
+# 4. Display Top 20 Candidates
+print("--- TOP 20 NATIVE SPECIES WITH HIGHEST INVASION POTENTIAL ---")
+head(watchlist, 20)
+write.csv(watchlist, "./models/watchlist_glmm_best_model.csv", row.names = FALSE)
+```
+
+#4) Variance partition
+```{r}
+#Prepare model for glmm.hp
+data_m1_var_p=data_m1 %>% 
+  mutate(
+         s_min_depth=scale(min_depth),
+         s_corals=scale(corals))
+
+#Run GLMM with pre-scaled variables
+m1_var_p <- lme4::glmer(
+  response ~ 
+    s_min_depth + 
+    s_corals +
+    (1 | Family),
+  data = data_m1_var_p,
+  family = binomial)
+
+library(glmm.hp)
+R2_partition_results <-glmm.hp(m1_var_p,
+                                type="R2")
+
+R2_partition_results
+```
+
+#5) Plot
+```{r}
+# Extract variance partition results from glmm.hp
+# The theoretical table contains the 'Individual' and 'I.perc(%)' columns
+vp_df <- as.data.frame(R2_partition_results$theoretical)
+vp_df$term <- rownames(vp_df)
+
+# 2. Clean terms to exactly match  m1_res labels
+vp_df <- vp_df %>%
+  mutate(
+    term_clean = case_when(
+      grepl("s_min_depth", term) ~ "Min. depth",
+      grepl("s_corals", term) ~ "Coral association",
+      TRUE ~ term
+    )
+  )
+
+# Join with tidied GLMM results and create a rich axis label
+m1_res <- m1_res %>%
+  left_join(vp_df, by = "term_clean") %>%
+  mutate(
+    # Create a label like: "Coral association (R² = 0.252, 62.9%)"
+    # Using sprintf ensures 3 decimal places are always shown for neatness
+    plot_label = paste0(term_clean, " (R²m = ", sprintf("%.3f", Individual), ", ", round(`I.perc(%)`, 1), "%)")
+  )
+
+# Generate the plot
+p1 <-
+  ggplot(m1_res, aes(
+    x = estimate,
+    y = reorder(plot_label, estimate), # Reorder using the new rich label
+    color = is_significant
+  )) +
+  geom_vline(
+    xintercept = 0,
+    linetype = "dashed",
+    color = "grey50",
+    size = 0.8
+  ) +
+  geom_pointrange(aes(xmin = conf.low, xmax = conf.high),
+                  size = 0.6,
+                  flatten = 0.5) +
+  scale_color_manual(values = c(
+    "Not Significant" = "grey70",
+    "Significant" = "#D9643E"
+  )) +
+  theme_bw() +
+  theme(
+    legend.position = "none", 
+    panel.grid.minor = element_blank(),
+    axis.text.y = element_text(size = 10) # Ensures the longer labels are readable
+  ) +
+  labs(
+    x = "Standardized coefficient",
+    y = "",
+    caption = r2_label_m1
+  )
+p1
+ggsave("./plots/Figure_4_best_model.png", p1, 
+       width = 15, height = 15, units = "cm", dpi = 300)
+```

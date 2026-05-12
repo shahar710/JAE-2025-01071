@@ -1,0 +1,642 @@
+---
+title: "stage_2_trait_space"
+author: "Shahar Chaikin"
+date: "2026-02-03"
+output: html_document
+---
+
+Produce holistic ordination aimed at testing the level of separation across assemblages
+
+Libraries
+```{r}
+library(FD)
+library(vegan)
+library(tidyverse)
+library(ggrepel)
+library(gridExtra)
+library(pairwiseAdonis)
+```
+
+#1) Prepare data
+```{r}
+sp_level_data <- read.csv("./data/sp_level_data.csv") %>%
+  
+  # C. Create Unique Labels for Plotting
+  # This ensures "Siganus rivulatus" appears as "S. rivulatus (RS)" and "S. rivulatus (Med)"
+  mutate(
+    plot_label = paste0(species, " (", ifelse(sea=="red", "RS", "Med"), ")")
+  )
+#Traits data (Body size excluded)
+traits <- sp_level_data %>%
+  select(`MaxN`=mean_MaxN,
+         `Commonness`=n_presence, 
+         `Depth range`=depth_range,
+         `Min. depth`=min_depth,
+         `Min. SBT`=sbt_min,
+         `SBT range`=sbt_range,
+         `Max. SBT`=sbt_max,
+         `Artificial`=artificial, 
+         `Corals`=corals,
+         `Seagrass`=seagrass,
+         `Silt`=silt,
+         `Gravel`=gravel,
+         `Sand`=sand,
+         `Rocks`=rocks,
+         `Habitat breadth`=B_prime_std,
+         `Algae`=macroalgae)
+```
+
+#2) Gower Distance & PCoA
+```{r}
+dist_matrix <- gowdis(traits)
+pcoa_res <- pcoa(dist_matrix)
+# Extract specifically the "Relative_eig" column (Variance Explained)
+# This gives the proportion (0 to 1) for every axis
+variance_explained <- pcoa_res$values$Relative_eig
+
+# Print the percentage for the first two axes (the ones plotted)
+axis_1_pct <- round(variance_explained[1] * 100, 1)
+axis_2_pct <- round(variance_explained[2] * 100, 1)
+
+print(paste0("PCoA Axis 1 explains: ", axis_1_pct, "%"))
+print(paste0("PCoA Axis 2 explains: ", axis_2_pct, "%"))
+# Extract Scores
+pcoa_df <- as.data.frame(pcoa_res$vectors[, 1:2])
+colnames(pcoa_df) <- c("PCoA1", "PCoA2")
+# Bind metadata safely
+pcoa_df <- cbind(pcoa_df, sp_level_data %>% select(species, group, plot_label, sea, status))
+write.csv(pcoa_df,"./models/pcoa_df.csv",row.names = F)
+# Calculate Centroids (for the Diamonds)
+centroids <- pcoa_df %>%
+  group_by(group) %>%
+  summarise(PCoA1 = mean(PCoA1), PCoA2 = mean(PCoA2))
+
+# A) Test for Homogeneity of Multivariate Dispersions
+# This checks if the groups have different "spreads" (variances)
+disp_test <- betadisper(dist_matrix, sp_level_data$group)
+print(anova(disp_test)) 
+# If p > 0.05, groups have similar spread (ideal). 
+# If p < 0.05, one group occupies a larger volume of trait space.
+# Test exactly which groups differ (Tukey's Honest Significant Difference)
+# This tells if the "Lessepsians - Med. Sea" are significantly more variable than "Lessepsians - Red Sea"
+tukey_disp <- TukeyHSD(disp_test)
+print(tukey_disp)
+
+# Calculate correlation between traits and PCoA axes (Loadings)
+trait_loadings <- envfit(pcoa_res$vectors[,1:2], traits, permutations = 999)
+```
+
+Export loadings
+```{r}
+#Extract the scores (direction vectors)
+loadings_scores <- as.data.frame(scores(trait_loadings, display = "vectors"))
+
+#Extract the statistics (R-squared and P-values) from the envfit object
+loadings_summary <- data.frame(
+  Trait = rownames(loadings_scores),
+  PCoA1 = loadings_scores$Axis.1,
+  PCoA2 = loadings_scores$Axis.2,
+  r2 = trait_loadings$vectors$r,
+  p_value = trait_loadings$vectors$pvals
+) %>%
+  arrange(p_value, desc(r2)) # Sort by significance (p) then strength (r2)
+
+#Save
+write.csv(loadings_summary, "./models/pcoa_trait_loadings.csv", row.names = FALSE)
+
+#View top drivers
+print(head(loadings_summary))
+```
+
+Export dispersion
+```{r}
+# 1. Convert Tukey output to a dataframe
+tukey_df <- as.data.frame(tukey_disp$group)
+
+# 2. Add the comparison names as a proper column (currently they are row names)
+tukey_df$Comparison <- rownames(tukey_df)
+
+# 3. Reorder columns for readability and round values
+tukey_summary <- tukey_df %>%
+  select(Comparison, diff, lwr, upr, p_adj = `p adj`) %>%
+  mutate(
+    diff = round(diff, 4),
+    lwr = round(lwr, 4),
+    upr = round(upr, 4),
+    p_adj = round(p_adj, 4),
+    Significance = ifelse(p_adj < 0.05, "*", "ns") # Add significance stars
+  ) %>%
+  arrange(p_adj) # Sort by most significant
+
+# 4. Save to CSV
+write.csv(tukey_summary, "./models/betadisper_tukey_results.csv", row.names = FALSE)
+
+# Print for verification
+print(tukey_summary)
+```
+
+#3) partitioning distance matrices among assemblages
+```{r}
+global_permanova <- adonis2(dist_matrix ~ group, data = sp_level_data, permutations = 9999)
+print(global_permanova)
+# B) Pairwise PERMANOVA
+pairwise_res <- pairwise.adonis(dist_matrix, sp_level_data$group,perm = 9999)
+print(pairwise_res)
+write.csv(pairwise_res,"./models/pairwise_permanova__res.csv",row.names = F)
+# 1. Visualize the Niche Breadth (Distance to Centroid)
+# This boxplot will show  who has the "biggest" niche
+boxplot(disp_test, xlab = "Assemblage", ylab = "Distance to centroid")
+```
+
+#4) Area overlaps
+Calculate overlaps and area relationships
+```{r}
+library(sf)
+# --- 1. DATA PREPARATION ---
+hull_data <- pcoa_df %>% 
+  ungroup() %>%
+  mutate(group_factor = factor(group, 
+                               levels = c("Natives - Red Sea", 
+                                          "Lessepsians - Red Sea", 
+                                          "Lessepsians - Med. Sea", 
+                                          "Natives - Med. Sea")))
+
+# --- 2. GENERATE HULLS (The Base R Way) ---
+# We use chull() to find points and store them in a standard dataframe
+hulls_df <- data.frame()
+
+for(g in levels(hull_data$group_factor)) {
+  sub_dat <- hull_data %>% filter(group_factor == g)
+  
+  # Calculate hull indices
+  if(nrow(sub_dat) >= 3) {
+    hull_idx <- chull(sub_dat$PCoA1, sub_dat$PCoA2)
+    
+    # Extract points and close the loop (first point = last point)
+    hull_pts <- sub_dat[c(hull_idx, hull_idx[1]), ]
+    
+    # Add to master dataframe
+    hulls_df <- rbind(hulls_df, hull_pts)
+  }
+}
+
+# --- 3. BACKGROUND STATS (Using SF for intersection math only) ---
+overlap_results <- data.frame()
+# Helper to make SF polygon from points
+make_poly <- function(df) {
+  mat <- as.matrix(df[, c("PCoA1", "PCoA2")])
+  st_polygon(list(mat)) %>% st_sfc() %>% st_as_sf()
+}
+
+# Loop for overlaps (Background calc)
+groups <- levels(hull_data$group_factor)
+pairs <- combn(groups, 2, simplify = FALSE)
+
+for(p in pairs) {
+  g1 <- p[1]; g2 <- p[2]
+  df1 <- hulls_df %>% filter(group_factor == g1)
+  df2 <- hulls_df %>% filter(group_factor == g2)
+  
+  if(nrow(df1) > 0 && nrow(df2) > 0) {
+    poly1 <- make_poly(df1); poly2 <- make_poly(df2)
+    a1 <- st_area(poly1); a2 <- st_area(poly2)
+    inter <- st_intersection(poly1, poly2)
+    a_shared <- if(length(inter) > 0) st_area(inter) else 0
+    
+    overlap_results <- rbind(overlap_results, data.frame(
+      Group_A = g1, Group_B = g2,
+      Overlap_Pct_of_A = round(as.numeric(a_shared/a1)*100, 1),
+      Overlap_Pct_of_B = round(as.numeric(a_shared/a2)*100, 1)
+    ))
+  }
+}
+
+print(overlap_results) # stats table
+
+# --- 4. CENTROIDS ---
+centroids_all <- hull_data %>%
+  group_by(group_factor) %>%
+  summarise(PCoA1 = mean(PCoA1), PCoA2 = mean(PCoA2), .groups = "drop")
+centroids_all
+```
+
+#5) Plot assemblages
+```{r}
+# --- 1. SETUP COLORS ---
+custom_colors <- c("Natives - Red Sea" = "#007989", 
+                   "Lessepsians - Red Sea"     = "#D9643E", 
+                   "Natives - Med. Sea" = "#073956", 
+                   "Lessepsians - Med. Sea"     = "#F8B954")
+
+# --- 2. SPLIT DATA INTO LAYERS ---
+# Instead of sorting, we just create two separate dataframes.
+# This forces ggplot to draw them in the order we write the code.
+
+# Background Layer (Natives)
+hulls_natives <- hulls_df %>% filter(grepl("Natives", group_factor))
+points_natives <- hull_data %>% filter(grepl("Natives", group_factor))
+
+# Foreground Layer (NIS - Invaders)
+hulls_nis <- hulls_df %>% filter(grepl("Lessepsians", group_factor))
+points_nis <- hull_data %>% filter(grepl("Lessepsians", group_factor))
+
+# --- 3. RECALCULATE ARROWS ---
+trait_loadings <- envfit(pcoa_res$vectors[,1:2], traits, permutations = 999)
+arrow_df <- as.data.frame(scores(trait_loadings, display = "vectors")) * 0.2
+arrow_df$trait <- rownames(arrow_df)
+arrow_df <- arrow_df %>%
+  mutate(vector_len = sqrt(Axis.1^2 + Axis.2^2))
+
+# --- 4. THE PLOT (TWO LAYERS) ---
+plot_hulls_all <- ggplot() +
+  
+  # LAYER 1: Natives Polygons (Bottom)
+  geom_polygon(data = hulls_natives, 
+               aes(x = PCoA1, y = PCoA2, fill = group_factor), 
+               alpha = 0.35, color = "black", size = 0.2) + 
+  
+  # LAYER 2: NIS Polygons (Top - Guaranteed)
+  geom_polygon(data = hulls_nis, 
+               aes(x = PCoA1, y = PCoA2, fill = group_factor), 
+               alpha = 0.735, color = "black", size = 0.2) + 
+  
+
+  # LAYER 6: NIS Points (Top Points)
+  geom_rug(
+    data = points_nis,
+    aes(x = PCoA1, y = PCoA2, color = group_factor),
+    #size = 1.5,
+    alpha = 0.6,
+    #shape = 21,
+    #color = "black",
+    show.legend = F
+  ) +
+  
+  # LAYER 5: Natives Points (Bottom Points)
+  geom_rug(
+    data = points_natives,
+    aes(x = PCoA1, y = PCoA2, color = group_factor),
+    #size = 1.5,
+   # alpha = 0.6,
+    #shape = 21,
+    #color = "black",
+    show.legend = F
+  ) +
+  
+  # LAYER 3: Arrows
+  geom_segment(data = arrow_df, 
+               aes(x = 0, y = 0, xend = Axis.1, yend = Axis.2, alpha = vector_len),
+               arrow = arrow(length = unit(0.2, "cm")), color = "black", size=0.6) +
+
+  # LAYER 4: Trait Labels
+  geom_text_repel(data = arrow_df, 
+                  aes(x = Axis.1, y = Axis.2, label = trait, alpha = vector_len),
+                  color = "black", fontface = "bold", size = 4.4,
+                  box.padding = 0.8,
+                  min.segment.length = 0
+                  #bg.color="white", 
+                  #bg.r=0.08
+                  ) +
+  # Scales & Legend
+  scale_fill_manual(
+    name = "Assemblage", 
+    values = custom_colors,
+    # THIS CONTROLS THE LEGEND ORDER:
+    breaks = c("Natives - Red Sea", "Lessepsians - Red Sea", "Lessepsians - Med. Sea", "Natives - Med. Sea") 
+  ) +
+  scale_color_manual(
+    name = "Assemblage", 
+    values = custom_colors,
+    # THIS CONTROLS THE LEGEND ORDER:
+    breaks = c("Natives - Red Sea", "Lessepsians - Red Sea", "Lessepsians - Med. Sea", "Natives - Med. Sea") 
+  )+
+  scale_alpha_continuous(range = c(0.2, 1), guide = "none") +
+  theme_classic() +
+  labs(
+    x = "PCoA 1",
+    y = "PCoA 2",
+    title = "A) Habitat space"#,
+    # caption = paste0(
+    #   "Native range comp.: P = 0.0001; ",
+    #   "Native-invaded range comp.: P = 0.0001; ",
+    #   "Invaded range comp.: P = 0.284"
+  #  )
+  )
+
+print(plot_hulls_all)
+```
+
+#6) Shared assembalge
+##6.1) Identify species present in BOTH seas
+
+```{r}
+shared_species_list <-  sp_level_data %>%
+  group_by(species) %>%
+  filter(n_distinct(sea) == 2) %>% # Must have exactly 2 sea entries
+  pull(species) %>%
+  unique()
+```
+
+##6.2) Extract PCoA Coordinates for these species from the Global PCoA
+We use the Global Space so the axes (PCoA1, PCoA2) mean the same thing for both groups
+```{r}
+rs_coords <- pcoa_df %>% 
+  filter(species %in% shared_species_list, sea == "red") %>%
+  arrange(species) %>% # Sort alphabetically to ensure alignment
+  select(species, PCoA1, PCoA2) %>%
+  remove_rownames() %>%  
+  column_to_rownames("species")
+
+med_coords <- pcoa_df %>% 
+  filter(species %in% shared_species_list, sea == "med") %>%
+  arrange(species) %>% # Sort alphabetically to match RS
+  select(species, PCoA1, PCoA2) %>%
+    remove_rownames() %>%  
+  column_to_rownames("species")
+
+#Validation check
+if(!identical(rownames(rs_coords), rownames(med_coords))) {
+  stop("Error: Row names do not match! Check sorting.")
+} else {
+  print("Data aligned correctly. Ready for Procrustes.")
+}
+```
+
+##6.3) Run Procrustes Analysis & Permutation Test
+This step rotates the Red Sea configuration to best fit the Mediterranean configuration. The residuals represent the shift distance.
+```{r}
+# 1. Run Procrustes Analysis
+# symmetric = TRUE calculates the fit without assuming one configuration is fixed
+proc_res <- procrustes(X = rs_coords, Y = med_coords, symmetric = TRUE)
+
+# 2. Test Significance (PROTEST)
+# Tests if the similarity between RS and Med niches is greater than random
+protest_res <- protest(X = rs_coords, Y = med_coords, permutations = 9999)
+
+# Print Global Results
+print(protest_res)
+# Interpretation:
+# - High Correlation (r): Niches are conserved (species do the same thing).
+# - Low Correlation: High niche shift.
+# - p-value (Is the match between these two maps better than random?): The RS configuration PREDICTS the Med configuration (non-random structure). In our case, non-significant means Species responded individually and chaotically
+
+
+#A value of 0.3 is low for a Procrustes test. It means there is very little overlap or congruence between the two shapes. For context, "conserved" niches usually show correlations > 0.7 or 0.8.
+
+#Sum of Squares represents the "mismatch" or error after trying to fit the two maps together. 0.91 (on a scale of 0 to 1) indicates that 81% of the variation in the Mediterranean position cannot be explained by the Red Sea position. This confirms that the shifts are massive.
+```
+
+
+##6.3) Extract Vector Shifts (Species-Specific Results) 
+Here we calculate exactly how far each species moved in the trait space.
+```{r}
+# 1. Extract the shift vectors
+# The 'residuals' from procrustes give the mismatch distance
+shifts_df <- data.frame(
+  species = rownames(rs_coords),
+  RS_PCoA1 = rs_coords$PCoA1,
+  RS_PCoA2 = rs_coords$PCoA2,
+  Med_PCoA1 = med_coords$PCoA1,
+  Med_PCoA2 = med_coords$PCoA2,
+  total_shift = residuals(proc_res) # The Euclidean distance of the shift
+)
+
+#total_shift: This is the Euclidean distance (or Procrustes residual) between the Red Sea point and the Mediterranean point.
+#High Value (> 0.3): Extreme Niche Shift (High Plasticity).
+#Low Value (< 0.1): Niche Conservatism (Doing the same thing as back home).
+
+# 2. Identify the Top 5 "Shifters" (Ecological Plasticity?)
+top_shifters <- shifts_df %>%
+  arrange(desc(total_shift)) %>%
+  head(5)
+
+print("Top 5 Species with Largest Niche Shifts:")
+print(top_shifters[, c("species", "total_shift")])
+```
+
+Ranking Traits based on PCoA Shifts
+This code requires the shifts_df (from Shift Plot) and arrow_df (from Environmental Drivers plot).
+```{r}
+# 1. Calculate the Species Movement Vector (The "Species Arrow")
+# How much did the species move along Axis 1 and Axis 2?
+species_vectors <- shifts_df %>%
+  select(species, RS_PCoA1, RS_PCoA2, Med_PCoA1, Med_PCoA2) %>%
+  mutate(
+    delta_1 = Med_PCoA1 - RS_PCoA1, # Change in PCoA1
+    delta_2 = Med_PCoA2 - RS_PCoA2  # Change in PCoA2
+  ) %>%
+  select(species, delta_1, delta_2)
+
+# 2. Get Trait Vectors (The "Environment Arrows")
+# We use arrow_df which contains the PCoA1/PCoA2 coordinates of each trait tip
+trait_vectors <- arrow_df %>%
+  select(trait, Axis.1, Axis.2)
+
+# 3. Calculate Projections (The "Alignment")
+# We loop through every species and every trait to see how well they align
+projections <- expand.grid(species = species_vectors$species, 
+                           trait = trait_vectors$trait) %>%
+  left_join(species_vectors, by = "species") %>%
+  left_join(trait_vectors, by = "trait") %>%
+  # --- THE CORE CALCULATION (Dot Product) ---
+  mutate(
+    # How much of the species' shift is explained by this trait?
+    projection = (delta_1 * Axis.1) + (delta_2 * Axis.2)
+  ) %>%
+  group_by(species) %>%
+  # Normalize so we can compare (optional, but helps interpretation)
+  arrange(species, desc(abs(projection)))
+
+# 4. View the "Main Driver" for each species
+top_contributors <- projections %>%
+  slice(1) %>% # Get the #1 strongest driver per species
+  select(species, trait, projection) %>%
+  mutate(direction = ifelse(projection > 0, "Increased", "Decreased"))
+
+print(top_contributors)
+#Analysis of vector projections revealed two distinct drivers of niche shifts. One group of invaders (e.g., Pterois miles, Fistularia commersonii) was characterized by a shift away from Coral associations, reflecting a 'release' from reef-dependence in the coral-poor Mediterranean. A second group (e.g., Torquigener flavimaculosus, Siganus luridus) was defined by a shift into habitats with high Sea Bottom Temperature (SBT) ranges, indicating an expansion into more seasonally variable environments characteristic of the temperate recipient basin.
+```
+
+##6.4) Plot
+Calculate the ratio and prints the conclusion based on Table 2 definitions
+```{r}
+library(sf)
+# 1. Prepare Data: Select ALL Invaders (status == 1)
+# We ensure we are using the full dataset, not just paired species
+nis_all <- pcoa_df %>% 
+  ungroup() %>%
+  filter(status == 1) %>%
+  mutate(sea_label = factor(sea, levels = c("red", "med"), 
+                            labels = c("Native Range (Red Sea)", "Invaded Range (Med)")))
+
+# 2. Calculate Hulls (Robust Function)
+get_hull <- function(df) {
+  if(nrow(df) < 3) return(NULL)
+  coords <- df %>% select(PCoA1, PCoA2) %>% as.matrix()
+  rownames(coords) <- NULL 
+  hull_id <- chull(coords)
+  poly_coords <- coords[c(hull_id, hull_id[1]), ]
+  st_sf(geometry = st_sfc(st_polygon(list(poly_coords))))
+}
+
+rs_poly  <- get_hull(nis_all %>% filter(sea == "red"))
+med_poly <- get_hull(nis_all %>% filter(sea == "med"))
+
+# 3. Calculate Centroids (Mean X, Mean Y for each group)
+centroids <- nis_all %>%
+  group_by(sea) %>%
+  summarise(
+    PCoA1 = mean(PCoA1),
+    PCoA2 = mean(PCoA2),
+    .groups = "drop"
+  ) %>%
+  mutate(sea_label = factor(sea, levels = c("red", "med"), 
+                            labels = c("Native Range (Red Sea)", "Invaded Range (Med)")))
+
+# 4. Calculate Statistics for Caption
+area_rs  <- st_area(rs_poly)
+area_med <- st_area(med_poly)
+ratio    <- as.numeric(area_med / area_rs)
+intersection_poly <- st_intersection(rs_poly, med_poly)
+overlap_pct <- as.numeric((st_area(intersection_poly) / area_med) * 100)
+contraction_pct <- (1 - ratio) * 100
+```
+
+Plot shared
+```{r}
+# --- 1. PREPARE DATA (THE FIX) ---
+# Instead of filter(status == 1), we keep anything labeled as "NIS" in the group column.
+# This ensures Seriola and Echeneis are kept even if their original status was 0.
+nis_all <- pcoa_df %>% 
+  ungroup() %>%
+  filter(grepl("Lessepsians", group)) %>% # <--- CHANGED FROM status == 1
+  mutate(sea_label = factor(sea, levels = c("red", "med"), 
+                            labels = c("Native Range (Red Sea)", "Invaded Range (Med)")))
+
+# --- 2. CALCULATE HULLS ---
+get_hull_df <- function(df, group_label) {
+  coords <- df %>% select(PCoA1, PCoA2)
+  hull_idx <- chull(coords$PCoA1, coords$PCoA2)
+  hull_pts <- df[c(hull_idx, hull_idx[1]), ]
+  return(hull_pts)
+}
+
+rs_hull_df <- get_hull_df(nis_all %>% filter(sea == "red"), "Native Range (Red Sea)")
+med_hull_df <- get_hull_df(nis_all %>% filter(sea == "med"), "Invaded Range (Med)")
+
+# --- 3. PREPARE ARROWS (Shared Species Only) ---
+arrow_data <- nis_all %>%
+  select(species, sea, PCoA1, PCoA2) %>%
+  pivot_wider(names_from = sea, values_from = c(PCoA1, PCoA2)) %>%
+  # Keep only species that have coordinates for BOTH seas
+  filter(!is.na(PCoA1_red) & !is.na(PCoA1_med))
+
+# --- 4. CENTROIDS ---
+centroids <- nis_all %>%
+  group_by(sea_label) %>%
+  summarise(PCoA1 = mean(PCoA1), PCoA2 = mean(PCoA2), .groups = "drop")
+
+# --- RE-DEFINE THE CAPTION 
+stats_caption <- paste0("r = ", round(protest_res$t0, 3),
+                        "; P = ", round(protest_res$signif, 3),
+                        "; m² = ", round(protest_res$ss, 3))
+
+# --- 5. THE PLOT ---
+shared_sp_plot <- ggplot() +
+  
+  # A. Hulls
+  geom_polygon(data = rs_hull_df, aes(x = PCoA1, y = PCoA2), 
+               fill = "#D9643E", alpha = 0.735, color = "black", size = 0.2) +
+  geom_polygon(data = med_hull_df, aes(x = PCoA1, y = PCoA2), 
+               fill = "#F8B954", alpha = 0.735, color = "black", size = 0.2) +
+  # D. Species Points
+  geom_point(data = nis_all, aes(x = PCoA1, y = PCoA2, color = sea_label), 
+             size = 2, alpha = 0.8,show.legend = F) +
+  # B. Shift Arrows
+  geom_segment(
+    data = arrow_data,
+    aes(
+      x = PCoA1_red,
+      y = PCoA2_red,
+      xend = PCoA1_med,
+      yend = PCoA2_med
+    ),
+    arrow = arrow(length = unit(0.2, "cm"), type = "open"),
+    color = "black",
+    size = 0.4
+  ) +
+  
+  # C. Labels (Only Shared Species)
+  geom_text_repel(data = arrow_data,
+    aes(x = PCoA1_red, y = PCoA2_red, label = species),
+    size = 4.4,
+    fontface = "italic",
+    color = "grey40",
+    nudge_x = -0.04,      # Pushes all labels 0.2 units to the LEFT
+    direction = "y",     # Once pushed left, stack them vertically (prevents messy angles)
+    hjust = 1,           # Right-align the text so it looks neat pointing to the data
+    xlim = c(-Inf, 0.05),
+    box.padding = 0.5,
+    max.overlaps = 50,
+    segment.alpha = 0.5) +
+  
+  # F. Styling
+  scale_color_manual(name = "Population", 
+                     values = c("Native Range (Red Sea)" = "#D9643E", 
+                                "Invaded Range (Med)" = "#F8B954")) +
+  scale_fill_manual(name = "Population", 
+                    values = c("Native Range (Red Sea)" = "#D9643E", 
+                               "Invaded Range (Med)" = "#F8B954")) +
+  
+  theme_classic() +
+  
+  labs(
+    x = "PCoA 1",
+    y = "PCoA 2",
+    title = "B) Habitat shifts"#,
+    #caption = stats_caption
+  ) +
+  coord_cartesian(xlim = c(-0.1787702, 0.2353858),
+                  ylim = c(-0.14, 0.21))
+
+print(shared_sp_plot)
+```
+
+##Bind
+```{r}
+# --- 3. COMBINE & SAVE ---
+# Arrange side by side (ncol = 2)
+combined_plot <-
+  grid.arrange(
+    plot_hulls_all+
+      theme(
+    legend.position = c(0.22, 0.85), 
+    legend.background = element_blank(),
+    legend.key = element_blank(),
+    legend.key.size = unit(0.75, "cm"),
+    legend.title = element_text(size = 12, face = "bold"),
+    legend.text = element_text(size = 12),
+    legend.margin = margin(0,0,0,0),
+    plot.caption = element_text(hjust = 0.5, face = "italic", size =11),
+    plot.caption.position = "plot", # Ensures it aligns to the image edge, not just the panel
+    axis.title = element_blank(),
+    title = element_text(size=14)
+  ),
+    shared_sp_plot+
+    theme(
+    plot.caption = element_text(hjust = .5, face = "italic", size =11),
+    plot.caption.position = "plot",
+    axis.title = element_blank(),
+    title = element_text(size=14)
+  ),
+    nrow = 2,
+    left = "PCoA 2",
+    bottom = "PCoA 1"
+  )
+
+# Save
+ggsave("./plots/Figure_3.png", combined_plot,
+       width = 20, height = 30, units = "cm", dpi = 300,bg = "white")
+ggsave("./plots/Figure_3.pdf", combined_plot,
+       width = 20, height = 30, units = "cm", dpi = 300,bg = "white")
+```

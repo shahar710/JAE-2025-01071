@@ -1,0 +1,464 @@
+---
+title: "stage_1_data_prep"
+author: "DAPR"
+date: "2026-02-02"
+output: html_document
+---
+
+This code aimed at loading the data and adding:
+1) invader/ non-invader status
+2) Add metadata such as habitats
+3) Group by assemblages
+4) create clean subsets
+
+Library
+```{r}
+library(tidyverse)
+```
+
+#1) Data wrangling
+```{r}
+#MaxN data 
+obs_data=readxl::read_excel("./data/18097061/med_red_MaxN_data.xlsx",sheet = 1) %>% 
+  select(1:11) %>% #based on [https://doi.org/10.12681/mms.41312](https://doi.org/10.12681/mms.41312)
+  left_join(read.csv("./data/is_lessepsian.csv"),
+            by="species") %>% #add status
+  mutate(status = replace_na(status, 0)) %>% #The two remaining native species are fixed to 0
+  left_join(readxl::read_excel("./data/18097061/Metadata.xlsx",sheet = 1) %>% 
+              select(OpCode,
+                     location,
+                     lat=lat_y,
+                     long=lon_x,
+                     seabed_form),
+            by="OpCode") %>% #Group data by assemblages
+  mutate(
+    group=case_when(
+      c(sea%in%"red" & status%in%0)~"Natives - Red Sea",
+      c(sea%in%"med"& status%in%0)~"Natives - Med. Sea",
+      c(sea%in%"red"& status%in%1)~"Lessepsians - Red Sea",
+      c(sea%in%"med"& status%in%1)~"Lessepsians - Med. Sea")) %>% 
+  mutate(
+    group=case_when(
+      c(sea%in%"red" & status%in%0 & species%in%"Seriola dumerili")~"Lessepsians - Red Sea",
+      c(sea%in%"red" & status%in%0 & species%in%"Echeneis naucrates")~"Lessepsians - Red Sea",
+      c(sea%in%"med" & status%in%0 & species%in%"Seriola dumerili")~"Lessepsians - Med. Sea",
+      c(sea%in%"med" & status%in%0 & species%in%"Echeneis naucrates")~"Lessepsians - Med. Sea",
+      TRUE~group)) %>%#Add species depth range
+  mutate(Family=as.factor(Family),
+         location=as.factor(location),
+         status=as.factor(status),
+         group=as.factor(group),
+         seabed_form=as.factor(seabed_form),
+         sea=as.factor(sea),
+         lat=as.numeric(lat),
+         long=as.numeric(long),
+         spatial_block = as.factor(paste(round(lat, 2), round(long, 2), sep = "_"))) %>% 
+  filter(!OpCode%in%c("isrsdot201119B","isrsdot201119A")) %>% 
+  ungroup()
+
+obs_data %>% 
+  group_by(sea) %>% 
+  summarise(deployments=n_distinct(OpCode),
+            species=n_distinct(species),
+            Total_MaxN=sum(MaxN))
+obs_data$species %>% n_distinct()
+```
+
+#2) Species-level traits
+```{r}
+#population level estimates (excluding body size)
+species_level_traits = obs_data %>%
+  filter(MaxN > 0) %>%
+  left_join(readxl::read_excel("./data/18097061/Metadata.xlsx",sheet = 1) %>% 
+              select(OpCode,
+                     date) %>% 
+              mutate(month=lubridate::month(date,label=T)) %>% 
+              select(-date),
+            by="OpCode") %>%
+  group_by(sea,species) %>%
+  summarise(
+    depth_range = max(depth) - min(depth),
+    min_depth=min(depth),
+    sbt_range = max(temperature) - min(temperature),
+    sbt_min=min(temperature),
+    sbt_max=max(temperature),
+    n_presence = n_distinct(OpCode),
+    .groups = "drop") %>% 
+  mutate(across(starts_with("sp_"), ~ifelse(is.infinite(.), NA, .))) %>% 
+  left_join(readxl::read_excel("./data/18097061/Data S2.xlsx", sheet = 1) %>% 
+              select(species,sea,artificial,corals,gravel,macroalgae,rocks,sand,seagrass,silt,`soft corals`),
+            by=c("sea","species")) %>%  # 1. Ensure all habitat columns are numeric
+  # Remove any duplicates introduced by the Excel join (due to the HOF estimated)
+  distinct(sea, species, .keep_all = TRUE) %>% 
+  mutate(across(c(artificial, corals, gravel, macroalgae, rocks, sand, seagrass, silt, `soft corals`), as.numeric)) %>%
+  # 2. Specific edit for Chromis dimidiata and global NA handling
+  mutate(
+    # Handle corals specifically
+    corals = case_when(
+      species == "Chromis dimidiata" ~ 1,
+      is.na(corals) ~ 0,
+      TRUE ~ corals
+    ),
+    # Handle all other habitat columns: 0 for Chromis and 0 for any NAs
+    across(c(artificial, gravel, macroalgae, rocks, sand, seagrass, silt, `soft corals`),
+           ~ case_when(
+             species == "Chromis dimidiata" ~ 0,
+             is.na(.) ~ 0,
+             TRUE ~ .)))
+```
+
+#3) Data containing true non-detection.
+```{r}
+#Expand to Include Zeros (Imputed Absences)
+# This accounts for sampling effort and zeros
+obs_data_inc_zeros <- obs_data %>%
+  # Temporarily treat species as character to prevent Sea-mixing
+  mutate(species = as.character(species)) %>%
+  group_by(sea) %>%
+  complete(species, 
+           nesting(OpCode, depth, temperature, location, lat, long, seabed_form, spatial_block), 
+           fill = list(MaxN = 0)) %>%
+  ungroup() %>%
+  
+  #join the Species-Level Traits
+  left_join(species_level_traits, by = c("sea", "species")) %>%
+  # 4. Final Cleanup for GLMM
+  group_by(sea, species) %>%
+  # Fill static categories like Family and Status
+  fill(Family, status, group, .direction = "downup") %>%
+  ungroup() %>% 
+  # Ensure any lingering FL columns from original data are completely dropped
+  select(-contains("FL"))
+```
+
+#4) Habitat breadth
+```{r}
+# 1. Calculate Resource Availability (aj) dynamically
+# Instead of hardcoding 124/123, we count distinct OpCodes per sea
+resource_prop <- obs_data %>%
+  filter(OpCode %in% unique(obs_data$OpCode)) %>%
+  group_by(sea) %>%
+  mutate(total_deployments = n_distinct(OpCode)) %>% # Total per sea
+  group_by(sea, seabed_form) %>%
+  summarise(
+    n_habitat = n_distinct(OpCode),
+    total_deployments = first(total_deployments),
+    .groups = "drop"
+  ) %>%
+  mutate(aj = n_habitat / total_deployments)
+
+# 2. Calculate Species Proportions (pj) and Hurlbert's Index
+Hurlbert_Calc <- obs_data %>%  # Sum MaxN per species/group/habitat
+  group_by(group, species, seabed_form) %>%
+  summarise(Nj = sum(MaxN), .groups = "drop_last") %>%
+  
+  # Ensure all habitats exist for all species (fill 0 if missing)
+  complete(seabed_form = unique(
+    readxl::read_excel("./data/18097061/Metadata.xlsx",sheet = 1) %>% 
+      filter(!seabed_form%in%"na") %>% 
+      distinct(seabed_form) %>% 
+      pull), fill = list(Nj = 0)) %>%
+  
+  # Calculate pj (proportion of individual usage)
+  group_by(group, species) %>%
+  mutate(
+    Y = sum(Nj),          # Total MaxN per species
+    pj = Nj / Y           # MaxN per habitat divided by the total MaxN
+  ) %>%
+  
+  # Join availability (aj) based on Group/Sea relationship
+  mutate(sea = case_when(
+    grepl("Med", group, ignore.case = TRUE) ~ "med",
+    grepl("Red", group, ignore.case = TRUE) ~ "red"
+  )) %>%
+  left_join(resource_prop %>% select(sea, seabed_form, aj), by = c("sea", "seabed_form")) %>%
+  
+  # --- THE MATH (Hurlbert's) ---
+  # Step 1: Sum of (pj^2 / aj)
+  group_by(group,sea, species) %>%
+  summarise(
+    # Hurlbert's Denominator: Sum(pj^2 / aj) - Intermediate mathematical term. Larger numbers here actually mean lower niche breadth.
+    sum_pj2_aj = sum((pj^2) / aj, na.rm = TRUE),
+    
+    # We need the minimum aj observed in that sea for standardization
+    min_aj = min(aj), 
+    
+    # Keep Metadata
+    Total_Abundance = first(Y),
+    .groups = "drop"
+  ) %>%
+  
+  # Step 2: Final Metric Calculation
+  mutate(
+    B_prime = 1 / sum_pj2_aj,                      # Hurlbert's B'
+    B_prime_std = (B_prime - min_aj) / (1 - min_aj) # Standardized B'A
+  ) %>%
+  
+  # Rounding for cleanliness
+  mutate(across(c(B_prime, B_prime_std), round, 3))
+
+# View Results
+head(Hurlbert_Calc)
+```
+
+#5) species-level data
+```{r}
+sp_level_data=obs_data_inc_zeros %>%
+  group_by(species,sea) %>%
+  summarise(
+    status = first(status),
+    group=first(group),
+    Family = first(Family),
+    mean_MaxN = mean(MaxN),
+    max_MaxN = max(MaxN),
+    n_presence=first(n_presence),
+    depth_range = first(depth_range),
+    min_depth=first(min_depth),
+    sbt_range=first(sbt_range),
+    sbt_min=min(sbt_min),
+    sbt_max=first(sbt_max),
+    corals = first(corals),
+    artificial = first(artificial),
+    gravel = first(gravel),
+    macroalgae = first(macroalgae),
+    rocks = first(rocks),
+    seagrass = first(seagrass),
+    silt = first(silt),
+    sand = first(sand),
+    soft_corals = first(`soft corals`),
+    .groups = "drop"
+  ) %>%
+  ungroup() %>% 
+  rowwise() %>%
+  mutate(
+    population=paste(species,sea,sep = "_")
+  ) %>%
+  ungroup() %>% 
+  filter(n_presence>1) %>% 
+  left_join(Hurlbert_Calc %>% 
+              select(sea,species,B_prime_std),
+            by=c("sea","species"))#Add Bstd
+
+sp_level_data %>% summary
+#Summarise populations and species
+sp_level_data$population %>% n_distinct()
+sp_level_data$species%>% n_distinct()
+sp_level_data %>% 
+  filter(sea%in%"red") %>% 
+  group_by(status) %>% 
+  summarise(sp=n_distinct(species))
+sp_level_data %>% 
+  filter(sea%in%"med") %>% 
+  group_by(status) %>% 
+  summarise(sp=n_distinct(species))
+```
+
+Corr matrix
+```{r}
+library(ggcorrplot)
+
+# 1. Prepare and Clean Data
+# Select only numeric continuous variables from  summary 
+corr_data <- sp_level_data %>%
+  select(
+    # Abundance / Range
+    max_MaxN,
+    n_presence,
+    # Environmental / Habitat
+    depth_range,
+    min_depth,
+    sbt_range,
+    sbt_min, 
+    sbt_max,
+    # Substrate %
+    corals,
+    rocks,
+    sand,
+    seagrass,
+    macroalgae,
+    artificial,
+    silt,
+    B_prime_std
+  ) %>%
+  # Rename columns for the plot
+  rename(
+    "Abundance (MaxN)" = max_MaxN,
+    "Commonness" = n_presence,
+    "Depth Range" = depth_range,
+    "Min Depth" = min_depth,
+    "SBT Range" = sbt_range,
+    "Min SBT" = sbt_min,
+    "Max SBT" = sbt_max,
+    "Cover: Coral" = corals,
+    "Cover: Rock" = rocks,
+    "Cover: Sand" = sand,
+    "Cover: Seagrass" = seagrass,
+    "Cover: Algae" = macroalgae,
+    "Cover: Artificial" = artificial,
+    "Cover: Silt" = silt,
+    "Habitat breadth"=B_prime_std
+  ) %>%
+  # Remove rows with NA to prevent errors
+  na.omit()
+
+# 2. Calculate Correlation Matrix
+corr_matrix <- cor(corr_data, method = "pearson")
+
+# 3. Calculate Significance (P-values) to cross out non-significant ones
+p_mat <- cor_pmat(corr_data)
+
+# 4. Generate the Plot
+corr_plot <- ggcorrplot(
+  corr_matrix,
+  method = "square",        
+  type = "lower",           
+  hc.order = TRUE,         
+  lab = TRUE,               
+  lab_size = 2.5,           
+  tl.col = "black",         
+  tl.srt = 45,              
+  colors = c("#6D9EC1", "white", "#E46726"), 
+  outline.col = "white",
+  ggtheme = ggplot2::theme_classic(),
+  tl.cex = 8
+)
+corr_plot
+# Save high-res version
+#ggsave("./plots/pearson_matrix.png", corr_plot, width = 15, height = 15, units = "cm", dpi = 300)
+```
+
+Write data
+```{r}
+#observed
+write.csv(obs_data,"./data/analysis_data.csv",row.names = F)
+#Observed plus absences
+write.csv(obs_data_inc_zeros,"./data/obs_data_inc_zeros.csv",row.names = F)
+#Species level data
+write.csv(sp_level_data,"./data/sp_level_data.csv",row.names = F)
+```
+
+#6) Plot variables
+```{r}
+library(Hmisc) 
+
+# 1. Define custom colors
+custom_colors <- c("Natives - Red Sea"      = "#007989", 
+                   "Lessepsians - Red Sea"  = "#D9643E", 
+                   "Natives - Med. Sea"     = "#073956", 
+                   "Lessepsians - Med. Sea" = "#F8B954")
+
+# 2. Prepare the data (body size removed)
+plot_data <- sp_level_data %>%
+  select(
+    group, 
+    mean_MaxN, 
+    n_presence, 
+    depth_range, 
+    min_depth, 
+    sbt_range, 
+    B_prime_std, 
+    corals, 
+    rocks, 
+    sand, 
+    seagrass, 
+    macroalgae, 
+    silt,
+    artificial
+  ) %>%
+  # Pivot all columns except 'group' into 'trait' and 'value' columns
+  pivot_longer(cols = -group, names_to = "trait", values_to = "value") %>%
+  filter(!is.na(value)) %>%
+  # Clean up trait names
+  mutate(trait = case_when(
+    trait == "mean_MaxN" ~ "Abundance (MaxN)",
+    trait == "n_presence" ~ "Commonness",
+    trait == "depth_range" ~ "Depth Range",
+    trait == "min_depth" ~ "Min. Depth",
+    trait == "sbt_range" ~ "Thermal (SBT) Range",
+    trait == "B_prime_std" ~ "Habitat Breadth",
+    trait == "corals" ~ "Coral Affinity",
+    trait == "rocks" ~ "Rock Affinity",
+    trait == "sand" ~ "Sand Affinity",
+    trait == "seagrass" ~ "Seagrass Affinity",
+    trait == "macroalgae" ~ "Algae Affinity",
+    trait == "silt" ~ "Silt Affinity",
+    trait == "artificial" ~ "Artificial Affinity",
+    TRUE ~ trait
+  ))
+
+#Lock trait order (excluding body size)
+trait_order <- c(
+  "Abundance (MaxN)",
+  "Commonness",
+  "Depth Range",
+  "Min. Depth",
+  "Thermal (SBT) Range",
+  "Habitat Breadth",
+  "Coral Affinity",
+  "Rock Affinity",
+  "Sand Affinity",
+  "Silt Affinity",
+  "Seagrass Affinity",
+  "Algae Affinity",
+  "Artificial Affinity"
+)
+plot_data$trait <- factor(plot_data$trait, levels = trait_order)
+
+# Lock in the factor levels so the order is consistent across all panels
+plot_data$group <- factor(plot_data$group, levels = c(
+  "Natives - Red Sea",
+  "Lessepsians - Red Sea",
+  "Lessepsians - Med. Sea",
+  "Natives - Med. Sea"
+))
+
+# 3. Build the Plot
+supp_plot <- ggplot(plot_data, aes(x = group, y = value)) +
+  
+  # Layer 1: Grey jittered points for the raw data 
+  geom_jitter(color = "grey50", alpha = 0.4, width = 0.15, size = 1.2) +
+  
+  # Layer 2: Mean and 95% Confidence Interval (colored by group)
+  stat_summary(
+    fun.data = "mean_cl_normal", 
+    geom = "pointrange", 
+    aes(color = group), 
+    size = 0.8,         
+    linewidth = 1       
+  ) +
+  
+  # Apply custom colors
+  scale_color_manual(values = custom_colors) +
+  
+  # Create a separate panel for each trait with independent y-axes
+  facet_wrap(~trait, scales = "free_y", ncol = 3) +
+  
+  # Theming for a clean, publication-ready layout
+  theme_bw(base_size = 12) +
+  theme(
+    # Remove x-axis text to avoid clutter; the legend will explain the groups
+    axis.text.x = element_blank(),
+    axis.ticks.x = element_blank(),
+    axis.title.x = element_blank(),
+    
+    # Style the facet headers
+    strip.background = element_rect(fill = "grey95", color = "black"),
+    strip.text = element_text(face = "bold", size = 11),
+    
+    # Legend formatting
+    legend.position = "bottom",
+    legend.title = element_blank(),
+    legend.text = element_text(size = 11),
+    
+    # Slight margin adjustments
+    panel.spacing = unit(1, "lines")
+  ) +
+  ylab("Trait Value")
+
+# Print the plot
+print(supp_plot)
+
+# 4. Save the plot
+# ggsave("./plots/Figure_S_Trait_distributions.png", plot = supp_plot, 
+#        width = 28, height = 28, units = "cm", dpi = 300, bg = "white")
+```
