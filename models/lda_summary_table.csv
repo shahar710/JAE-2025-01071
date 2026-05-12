@@ -1,0 +1,5 @@
+"Comparison","LOOCV_AUC"
+"Native range comparison",0.651
+"Native-invaded range comparison",0.971
+"Invaded range comparison",0.509
+"Native-invaded range comparison (sensitivity)",0.827

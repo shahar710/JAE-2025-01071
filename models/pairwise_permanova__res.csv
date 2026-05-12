@@ -1,0 +1,7 @@
+"pairs","Df","SumsOfSqs","F.Model","R2","p.value","p.adjusted","sig"
+"Natives - Red Sea vs Natives - Med. Sea",1,1.12462560633979,54.7025797845998,0.280954571044295,1e-04,6e-04,"**"
+"Natives - Red Sea vs Lessepsians - Red Sea",1,0.147167507167158,8.59978253530267,0.06485517827311,1e-04,6e-04,"**"
+"Natives - Red Sea vs Lessepsians - Med. Sea",1,0.680809915322558,37.0392947501911,0.228582176979312,1e-04,6e-04,"**"
+"Natives - Med. Sea vs Lessepsians - Red Sea",1,0.436353637912752,16.6750884218487,0.250094732778554,1e-04,6e-04,"**"
+"Natives - Med. Sea vs Lessepsians - Med. Sea",1,0.0395198119293178,1.35817033754959,0.0259399885212481,0.2474,1,""
+"Lessepsians - Red Sea vs Lessepsians - Med. Sea",1,0.263419063271563,12.6688105856763,0.265767289555218,1e-04,6e-04,"**"
