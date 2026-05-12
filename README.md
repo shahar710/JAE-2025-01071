@@ -87,6 +87,3 @@ Then, open the **`code_for_submission.Rproj`** file in RStudio. Running the scri
 If you use the data or code in this repository, please cite the original publication:
 
 > Chaikin, S., Gavriel, T., Deveto, A., Malamud, S., & Belmaker, J. (2024). Native habitat affinities predict fish invasions with post-invasion habitat shifts. *Journal of Animal Ecology*. [DOI Link]
-
-## 📜 License
-This project is licensed under the MIT License - see the LICENSE file for details.
