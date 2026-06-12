@@ -1,6 +1,6 @@
 # Code and Data for: "Native habitat affinities predict fish invasions with post-invasion habitat shifts"
 
-[![DOI](https://img.shields.io/badge/DOI-Pending-blue.svg)](https://doi.org/10.1111/1365-2656.XXXXX)
+[![DOI](https://img.shields.io/badge/DOI-10.1111%2F1365--2656.70293-blue.svg)](https://doi.org/10.1111/1365-2656.70293)
 
 This repository contains the complete analytical pipeline, data, and R scripts required to reproduce the analyses, statistical models, and figures presented in the *Journal of Animal Ecology* manuscript. The codebase is structured sequentially into distinct stages to facilitate reproducibility and transparency, from initial data processing to the final ensemble predictions of invasion risk.
 
@@ -24,7 +24,7 @@ Below are the top 10 "High Consensus" species—those whose predicted probabilit
 | **9** | *Lethrinus variegatus* | Lethrinidae | 0.32 | High consensus |
 | **10** | *Parupeneus rubescens* | Mullidae | 0.32 | High consensus |
 
-*(Note: The full ensemble assessment of all evaluated species can be found in Table S6 of the manuscript's supplementary materials).*
+*Note: The full ensemble assessment of all evaluated species can be found in Table S6 of the manuscript's supplementary materials.*
 
 ---
 
