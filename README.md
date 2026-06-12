@@ -6,6 +6,28 @@ This repository contains the complete analytical pipeline, data, and R scripts r
 
 ---
 
+## 🚨 Watchlist: Top 10 High-Risk Invasion Candidates
+By synthesizing linear discriminant and mixed-modelling approaches into a cross-validated ensemble index, we prioritized specific Red Sea species as high-risk candidates for future Mediterranean invasion. 
+
+Below are the top 10 "High Consensus" species—those whose predicted probabilities exceed the empirically derived optimal risk threshold in both independent models. 
+
+| Rank | Species | Family | Ensemble Probability | Consensus Group |
+| :---: | :--- | :--- | :---: | :--- |
+| **1** | *Arothron stellatus* | Tetraodontidae | 0.59 | High consensus |
+| **2** | *Parupeneus heptacantha* | Mullidae | 0.55 | High consensus |
+| **3** | *Turrum fulvoguttatum* | Carangidae | 0.50 | High consensus |
+| **4** | *Rhinobatos punctifer* | Rhinobatidae | 0.46 | High consensus |
+| **5** | *Nemipterus zysron* | Nemipteridae | 0.42 | High consensus |
+| **6** | *Abalistes stellatus* | Balistidae | 0.39 | High consensus |
+| **7** | *Gnathanodon speciosus* | Carangidae | 0.39 | High consensus |
+| **8** | *Gymnothorax angusticauda* | Muraenidae | 0.38 | High consensus |
+| **9** | *Lethrinus variegatus* | Lethrinidae | 0.32 | High consensus |
+| **10** | *Parupeneus rubescens* | Mullidae | 0.32 | High consensus |
+
+*(Note: The full ensemble assessment of all evaluated species can be found in Table S6 of the manuscript's supplementary materials).*
+
+---
+
 ## 📁 Core Data File
 **File:** `sp_level_data.csv`
 
