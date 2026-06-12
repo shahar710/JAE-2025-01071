@@ -26,6 +26,12 @@ Below are the top 10 "High Consensus" species—those whose predicted probabilit
 
 *Note: The full ensemble assessment of all evaluated species can be found in Table S6 of the manuscript's supplementary materials.*
 
+<div align="center">
+  <img src="Abalistes_stellatus_AD_58334_05.jpg" alt="Abalistes stellatus - High Risk Candidate" width="600"/>
+  <br>
+  <i>Abalistes stellatus</i> - High Risk Candidate
+</div>
+
 ---
 
 ## 📁 Core Data File
